@@ -28,8 +28,7 @@ Neither is 22, because of two rules the data actually follows:
 | 3 | Add back a customer who was legitimately sent to twice | **22** | Customer C20 was sent to twice under a standalone campaign (not a retry) — those two sends should both count, but counting unique customers had wrongly merged them into one |
 
 The exact queries behind each row of this table are in
-[`sql/investigation_steps.sql`](sql/investigation_steps.sql) — see below for
-what that file is and how to read it.
+[`sql/investigation_steps.sql`](sql/investigation_steps.sql) 
 
 ## The final SQL query
 
