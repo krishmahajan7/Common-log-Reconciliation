@@ -1,85 +1,100 @@
 # Comm-Log Send Reconciliation
 
-Reconciling Finance's reported `target_base = 22` for merchant 501, October 2026,
-across all Diwali campaigns, from the raw `comm_log.db` data.
+## The problem
 
-## TL;DR
+Finance says the true `target_base` (qualifying sends) for merchant 501's
+Diwali campaigns in October 2026 is **22**. This repo shows how to get from
+the raw data to that number, and explains exactly why a simple, obvious query
+does not.
 
-The naive query gives 30 (raw rows) or 25 (distinct customers). Two rules in the
-data model close the gap to 22:
+## Summary
 
-1. A campaign that hasn't cleared approval doesn't count, even if sends already
-   went out for it.
-2. Deduping by customer only applies **within a retry chain** — a standalone
-   campaign counts every send as its own event, even if the same customer
-   appears twice.
+A plain row count gives 30. A plain "unique customers" count gives 25.
+Neither is 22, because of two rules the data actually follows:
 
-## Reconciliation bridge
+1. A campaign that hasn't been approved yet doesn't count — even if messages
+   already went out for it.
+2. Customers should only be deduplicated **inside a retry chain** (a campaign
+   plus its retries). A standalone campaign with no retries counts every send
+   separately, even if it happens to hit the same customer twice.
 
-| Step | Description | Result | Reason |
+## How the number was worked out (the bridge)
+
+| Step | What was tried | Result | Why |
 |---|---|---|---|
-| 0 | Naive `COUNT(*)` on `communication_log` | 30 | Starting point — treats every send attempt as a qualifying send |
-| 1 | Switch to `COUNT(DISTINCT customer_id)` | 25 | `target_base` sounds like "customers reached," not raw attempts — dataset shows customers repeating (retries + one plain re-send) |
-| 2 | Exclude sends from campaigns where `creation_status = 'approval_awaiting'` | 21 | Campaign 9004 has processed sends (C11–C14) but was never approved — the data dictionary is explicit that unapproved campaigns don't count even if the send pipeline already ran |
-| 3 | Add back a double-counted customer under a **standalone** campaign | **22** | Customer C20 was sent twice under campaign 9101, which has no retry chain (no parent, no children). Dedup only applies *within* a retry chain — a standalone campaign counts every send as its own event. Global `DISTINCT` had wrongly collapsed C20's two sends into one |
+| 0 | Count every row in `communication_log` | 30 | Simplest possible starting point — treats every send as a qualifying send |
+| 1 | Count unique customers instead | 25 | `target_base` sounds like "customers reached," not raw send attempts |
+| 2 | Remove sends from campaigns that were never approved | 21 | Campaign 9004 had sends go out, but its approval was still pending — the data dictionary says unapproved campaigns don't count |
+| 3 | Add back a customer who was legitimately sent to twice | **22** | Customer C20 was sent to twice under a standalone campaign (not a retry) — those two sends should both count, but counting unique customers had wrongly merged them into one |
 
-Full step-by-step queries, in the order they were run: [`sql/investigation_steps.sql`](sql/investigation_steps.sql)
+The exact queries behind each row of this table are in
+[`sql/investigation_steps.sql`](sql/investigation_steps.sql) — see below for
+what that file is and how to read it.
 
-## Root cause
+## The final SQL query
 
-The naive query is wrong for two independent reasons, not one:
-
-1. It counts sends from campaigns that haven't cleared approval yet — the send
-   pipeline can run ahead of approval bookkeeping, so "processed" doesn't mean
-   "eligible."
-2. It applies the same dedup rule (by customer) everywhere, but the data model
-   only wants that dedup applied *within a retry chain*. A standalone campaign
-   is a different kind of thing — every send under it is a distinct event.
-
-## Final query
-
-**[`sql/target_base.sql`](sql/target_base.sql) is the answer** — run it with:
+[`sql/target_base.sql`](sql/target_base.sql) is the answer. Run it with:
 
 ```bash
 sqlite3 data/comm_log.db < sql/target_base.sql
 ```
 
-It uses a recursive query to trace every campaign back to the original
-campaign that started its retry chain, no matter how many retries deep the
-chain goes. It then counts distinct customers once per chain, and counts
-every send individually for standalone campaigns (a "chain" of size 1).
+**What it does, in plain terms:** every campaign is traced back to the
+original campaign that started its retry chain (however many retries deep
+that chain goes). Then:
+- If a chain has more than one campaign in it, customers are counted once
+  each, no matter how many times they were retried.
+- If a campaign is standalone (no retries), every send counts on its own.
 
-Broken out by chain, the three underlying communications for merchant 501 are:
+Only campaigns that are both approved and finished processing are included.
 
-| Root campaign | Chain members | Treatment | Qualifying sends |
+Broken down by chain:
+
+| Campaign | Made up of | How it's counted | Sends counted |
 |---|---|---|---|
-| 9001 | 9001, 9002, 9003, 9004 | Chain — dedupe customers (9004 excluded: not approved) | 10 |
-| 9101 | 9101 | Standalone — count every send | 7 |
-| 9201 | 9201, 9202 | Chain — dedupe customers | 5 |
+| Wave 1 | 9001, 9002, 9003 (9004 excluded — not approved) | Retry chain — unique customers | 10 |
+| Flash Sale | 9101 | Standalone — every send counts | 7 |
+| Wave 2 | 9201, 9202 | Retry chain — unique customers | 5 |
 | | | **Total** | **22** |
 
-### Alternative implementations
+## Other ways to write the same query
 
-The `sql/` folder also has three other working implementations of the same
-calculation, kept to show different ways of solving the same problem — not
-because there was any doubt about the answer. All four return 22.
+The `sql/` folder has three more files that solve this the same way but
+written differently — kept to show a few different techniques, not because
+there was any doubt about the answer. All four give 22.
 
-| File | Approach | Tradeoff vs. the main query |
-|---|---|---|
-| [`sql/alt_approach_selfjoin.sql`](sql/alt_approach_selfjoin.sql) | Two self-joins (parent, grandparent) instead of recursion, plus a window function for chain size | Simpler to read, but only correct because no chain here is deeper than 3 levels — a longer chain would silently resolve to the wrong root instead of failing |
-| [`sql/alt_approach_split_sum.sql`](sql/alt_approach_split_sum.sql) | Same recursive root-resolution, but computes the chain total and the standalone total as two separate named blocks, then adds them | Same rules, same answer — just organized so each half is easier to explain on its own; also surfaces the 15 / 7 split for free |
-| [`sql/alt_approach_temptables.sql`](sql/alt_approach_temptables.sql) | Materializes each step as a temp table instead of chaining CTEs | Lets you inspect any intermediate step directly while debugging, at the cost of being a multi-statement script instead of one query |
+- **`alt_approach_selfjoin.sql`** — instead of a recursive query, this joins
+  the campaign table to itself twice to jump straight to a campaign's parent
+  and grandparent. Easier to read, but only works because no chain in this
+  data is more than 3 levels deep — a longer chain would quietly break it.
+- **`alt_approach_split_sum.sql`** — same logic as the main query, but instead
+  of handling retry chains and standalone campaigns in one combined step, it
+  calculates each one separately and adds them together at the end.
+- **`alt_approach_temptables.sql`** — breaks the work into temporary tables
+  built one step at a time, instead of one query. Useful for checking each
+  in-between result while debugging, at the cost of needing several steps
+  instead of one.
 
-## Validation
+## The investigation file
 
-Two independently-implemented calculations agree on 22:
+[`sql/investigation_steps.sql`](sql/investigation_steps.sql) contains the
+actual queries that were run, in the order they were run, to build the bridge
+table above — starting from the naive count, then narrowing down exactly why
+it didn't match 22. This exists so the bridge isn't just a claim — anyone can
+re-run these same queries and see the same findings.
 
-- **SQL** (`sql/target_base.sql`): recursive query to resolve retry-chain roots.
-- **Pandas** (`scripts/validate_independent.py`): manual parent-pointer walk,
-  no SQL at all — a different implementation of the same rule.
+## The validation script
+
+[`scripts/validate_independent.py`](scripts/validate_independent.py) checks
+the answer a second, completely different way — using Python and pandas
+instead of SQL, and manually following each campaign back to its retry-chain
+root instead of using a recursive query. Run it with:
+
+```bash
+python3 scripts/validate_independent.py
+```
 
 ```
-$ python3 scripts/validate_independent.py
   root members method                       count
   9001       4 distinct customers (chain)      10
   9101       1 raw row count (standalone)       7
@@ -89,51 +104,66 @@ Computed target_base: 22
 Matches sql/target_base.sql.
 ```
 
-Two unrelated code paths landing on the same number is stronger evidence than
-either one alone — it rules out a bug in one query happening to look right.
+Two completely different methods landing on the same number is stronger
+proof than either one alone — it rules out one query just happening to look
+right by coincidence.
 
-**Other things checked that turned out not to matter** (kept separate from the
-bridge since the assignment specifically asks not to pad it with adjustments
-that had no effect):
+## Things checked that turned out not to matter
 
-- `channel` is uniformly `'sms'` — no cross-channel duplicate-send risk.
-- `credit_used` is always `1` — not a weighting factor on the metric.
-- `sent_time` equals `scheduled_time` for every row — no send-vs-schedule lag.
-- The October 2026 date filter is a no-op — every row already falls inside
-  `2026-10-01` to `2026-10-31` (kept in the query anyway, since a production
-  version of this query shouldn't rely on the sample happening to be clean).
-- No customer in a finalized retry chain fails on *every* attempt — so this
-  dataset can't actually distinguish "reached" (attempted) from "delivered
-  at least once" as the definition of target_base. Flagged below since it's a
-  real open question, not something resolved by the data.
+These didn't change the final number, but were worth ruling out rather than
+ignoring:
+
+- Every message was sent by the same channel (`sms`) — no risk of the same
+  message being double-counted across channels.
+- `credit_used` is always 1 — not something that needed to be factored in.
+- `sent_time` and `scheduled_time` are always identical — no lag to account for.
+- The October date filter doesn't actually remove any rows here, but it's
+  kept in the query anyway, since a real version of this query shouldn't
+  assume every future dataset will already be this clean.
+- No customer in a chain failed on *every* attempt — every retried customer
+  eventually got delivered. See below for why that matters.
+- No customer was ever part of more than one campaign chain — each customer
+  belongs to exactly one. Checked, not assumed.
 
 ## What surprised me
 
-Every customer in a retry chain who ever failed eventually got delivered on a
-later attempt within the same chain — there's no case in this dataset of a
-customer who was retried and still never delivered. That means I couldn't
-actually tell from the data whether `target_base` counts customers who were
-*attempted* in a chain or only those *delivered* at least once in it — the
-spec says "reached," which reads like attempted, but the only example given
-happens to end in delivery. It didn't move the final number here, but it's a
-real open question, not something resolved by the data.
+Every customer who was retried eventually got delivered somewhere in their
+chain — there's no case in this data of a customer who was retried and still
+never got the message. That means the data can't actually tell us whether
+`target_base` should count customers who were *attempted*, or only those who
+were *delivered* at least once. The word "reached" suggests attempted, but
+the only example given happens to end in a delivery either way. It didn't
+change the final number, but it's a real open question worth confirming.
 
-## Repo contents
+A couple of smaller things stood out too:
+
+- **The unapproved campaign's own name gives away its status** — it's
+  literally called `"Diwali Cart Recovery - Retry C (pending)"`. It would be
+  tempting to spot it just by reading names, but that's not something to
+  rely on — the actual approval status field is what should decide this,
+  since naming conventions won't always be this convenient.
+- **The two retry chains aren't the same shape.** One goes three campaigns
+  deep, the other only two. A query that assumed "every campaign has at most
+  one retry" would have worked on one chain and silently failed on the other
+  — a real reason the query needed to handle chains of any length, not just
+  a fixed number of retries.
+
+## Files in this repo
 
 ```
-README.md                        this file
+README.md                         this file
 
-sql/target_base.sql               the answer — recursive CTE
-sql/alt_approach_selfjoin.sql     alternative: self-joins, no recursion
-sql/alt_approach_split_sum.sql    alternative: chain + standalone totals added separately
-sql/alt_approach_temptables.sql   alternative: temp tables instead of CTEs
-sql/investigation_steps.sql       the queries behind the bridge, in the order run
+sql/target_base.sql                the final answer
+sql/alt_approach_selfjoin.sql      a different way to write the same query
+sql/alt_approach_split_sum.sql     another different way to write it
+sql/alt_approach_temptables.sql    a third different way to write it
+sql/investigation_steps.sql        the queries behind the bridge table
 
-scripts/validate_independent.py   independent (non-SQL) cross-check of the final number
+scripts/validate_independent.py    a second, independent check of the answer
 
-data/comm_log.db                  raw data (SQLite)
-data/campaign.csv                 same data, CSV
-data/communication_log.csv        same data, CSV
-data/DATA_DICTIONARY.md           schema + data dictionary as provided
-data/generate_dataset.py          script that generated the synthetic dataset, as provided
+data/comm_log.db                   the raw data (SQLite)
+data/campaign.csv                  same data, as a CSV
+data/communication_log.csv         same data, as a CSV
+data/DATA_DICTIONARY.md            schema and field definitions, as provided
+data/generate_dataset.py           the script that generated this data, as provided
 ```
