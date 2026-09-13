@@ -135,13 +135,20 @@ were *delivered* at least once. The word "reached" suggests attempted, but
 the only example given happens to end in a delivery either way. It didn't
 change the final number, but it's a real open question worth confirming.
 
-A couple of smaller things stood out too:
+More concretely: the four customers under the excluded campaign (C11–C14)
+aren't retries of anyone else — they're new people who were never contacted
+before. That means the approval gate is protecting the *reported number*, not
+the actual customer experience: those four people were already messaged,
+regardless of what Finance's number says. It raises a real follow-up question
+too — if that campaign gets approved later, do those sends retroactively
+belong to October, or to whichever month the approval happens to land in?
 
-- **The unapproved campaign's own name gives away its status** — it's
-  literally called `"Diwali Cart Recovery - Retry C (pending)"`. It would be
-  tempting to spot it just by reading names, but that's not something to
-  rely on — the actual approval status field is what should decide this,
-  since naming conventions won't always be this convenient.
+Two smaller things stood out as well:
+
+- **The excluded campaign's own name gives away its status** — it's literally
+  called `"Diwali Cart Recovery - Retry C (pending)"`. Convenient here, but
+  not something to rely on in general — the actual approval status field is
+  what should decide this.
 - **The two retry chains aren't the same shape.** One goes three campaigns
   deep, the other only two. A query that assumed "every campaign has at most
   one retry" would have worked on one chain and silently failed on the other
