@@ -23,29 +23,7 @@ data model close the gap to 22:
 | 2 | Exclude sends from campaigns where `creation_status = 'approval_awaiting'` | 21 | Campaign 9004 has processed sends (C11–C14) but was never approved — the data dictionary is explicit that unapproved campaigns don't count even if the send pipeline already ran |
 | 3 | Add back a double-counted customer under a **standalone** campaign | **22** | Customer C20 was sent twice under campaign 9101, which has no retry chain (no parent, no children). Dedup only applies *within* a retry chain — a standalone campaign counts every send as its own event. Global `DISTINCT` had wrongly collapsed C20's two sends into one |
 
-Full step-by-step queries: [`sql/investigation_steps.sql`](sql/investigation_steps.sql)
-
-## Final query
-
-See [`sql/target_base.sql`](sql/target_base.sql). Run it with:
-
-```bash
-sqlite3 data/comm_log.db < sql/target_base.sql
-```
-
-The query resolves every campaign to the root of its retry chain (via a
-recursive CTE on `parent_id`), keeps only campaigns that have cleared approval
-*and* finished processing, then counts distinct customers for chains with more
-than one campaign, and raw row counts for standalone campaigns (chain size 1).
-
-Broken out by chain, the three underlying communications for merchant 501 are:
-
-| Root campaign | Chain members | Treatment | Qualifying sends |
-|---|---|---|---|
-| 9001 | 9001, 9002, 9003, 9004 | Chain — dedupe customers (9004 excluded: not approved) | 10 |
-| 9101 | 9101 | Standalone — count every send | 7 |
-| 9201 | 9201, 9202 | Chain — dedupe customers | 5 |
-| | | **Total** | **22** |
+Full step-by-step queries, in the order they were run: [`sql/investigation_steps.sql`](sql/investigation_steps.sql)
 
 ## Root cause
 
@@ -58,23 +36,57 @@ The naive query is wrong for two independent reasons, not one:
    only wants that dedup applied *within a retry chain*. A standalone campaign
    is a different kind of thing — every send under it is a distinct event.
 
+## Final query
+
+**[`sql/target_base.sql`](sql/target_base.sql) is the answer** — run it with:
+
+```bash
+sqlite3 data/comm_log.db < sql/target_base.sql
+```
+
+It uses a recursive query to trace every campaign back to the original
+campaign that started its retry chain, no matter how many retries deep the
+chain goes. It then counts distinct customers once per chain, and counts
+every send individually for standalone campaigns (a "chain" of size 1).
+
+Broken out by chain, the three underlying communications for merchant 501 are:
+
+| Root campaign | Chain members | Treatment | Qualifying sends |
+|---|---|---|---|
+| 9001 | 9001, 9002, 9003, 9004 | Chain — dedupe customers (9004 excluded: not approved) | 10 |
+| 9101 | 9101 | Standalone — count every send | 7 |
+| 9201 | 9201, 9202 | Chain — dedupe customers | 5 |
+| | | **Total** | **22** |
+
+### Alternative implementations
+
+The `sql/` folder also has three other working implementations of the same
+calculation, kept to show different ways of solving the same problem — not
+because there was any doubt about the answer. All four return 22.
+
+| File | Approach | Tradeoff vs. the main query |
+|---|---|---|
+| [`sql/alt_approach_selfjoin.sql`](sql/alt_approach_selfjoin.sql) | Two self-joins (parent, grandparent) instead of recursion, plus a window function for chain size | Simpler to read, but only correct because no chain here is deeper than 3 levels — a longer chain would silently resolve to the wrong root instead of failing |
+| [`sql/alt_approach_split_sum.sql`](sql/alt_approach_split_sum.sql) | Same recursive root-resolution, but computes the chain total and the standalone total as two separate named blocks, then adds them | Same rules, same answer — just organized so each half is easier to explain on its own; also surfaces the 15 / 7 split for free |
+| [`sql/alt_approach_temptables.sql`](sql/alt_approach_temptables.sql) | Materializes each step as a temp table instead of chaining CTEs | Lets you inspect any intermediate step directly while debugging, at the cost of being a multi-statement script instead of one query |
+
 ## Validation
 
 Two independently-implemented calculations agree on 22:
 
-- **SQL** (`sql/target_base.sql`): recursive CTE to resolve retry-chain roots.
+- **SQL** (`sql/target_base.sql`): recursive query to resolve retry-chain roots.
 - **Pandas** (`scripts/validate_independent.py`): manual parent-pointer walk,
-  no recursion, no CTEs — a different implementation of the same rule.
+  no SQL at all — a different implementation of the same rule.
 
 ```
 $ python3 scripts/validate_independent.py
-  root  size method                        qty
-  9001     4 distinct customers (chain)     10
-  9101     1 raw row count (standalone)      7
-  9201     2 distinct customers (chain)      5
+  root members method                       count
+  9001       4 distinct customers (chain)      10
+  9101       1 raw row count (standalone)       7
+  9201       2 distinct customers (chain)       5
 
-INDEPENDENT TOTAL: 22
-Matches sql/target_base.sql. ✓
+Computed target_base: 22
+Matches sql/target_base.sql.
 ```
 
 Two unrelated code paths landing on the same number is stronger evidence than
@@ -92,8 +104,8 @@ that had no effect):
   version of this query shouldn't rely on the sample happening to be clean).
 - No customer in a finalized retry chain fails on *every* attempt — so this
   dataset can't actually distinguish "reached" (attempted) from "delivered
-  at least once" as the definition of target_base. Flagged in "What surprised
-  me" below since it's a real open question, not something resolved by the data.
+  at least once" as the definition of target_base. Flagged below since it's a
+  real open question, not something resolved by the data.
 
 ## What surprised me
 
@@ -104,19 +116,24 @@ actually tell from the data whether `target_base` counts customers who were
 *attempted* in a chain or only those *delivered* at least once in it — the
 spec says "reached," which reads like attempted, but the only example given
 happens to end in delivery. It didn't move the final number here, but it's a
-real ambiguity I'd want confirmed before trusting this metric on a merchant
-where a whole chain fails outright.
+real open question, not something resolved by the data.
 
 ## Repo contents
 
 ```
-README.md                      this file
-sql/target_base.sql             final query (single source of truth)
-sql/investigation_steps.sql     the four queries behind the bridge above
-scripts/validate_independent.py independent (non-SQL) cross-check of the final number
-data/comm_log.db                raw data (SQLite)
-data/campaign.csv               same data, CSV
-data/communication_log.csv      same data, CSV
-data/DATA_DICTIONARY.md         schema + data dictionary as provided
-data/generate_dataset.py        script that generated the synthetic dataset, as provided
+README.md                        this file
+
+sql/target_base.sql               the answer — recursive CTE
+sql/alt_approach_selfjoin.sql     alternative: self-joins, no recursion
+sql/alt_approach_split_sum.sql    alternative: chain + standalone totals added separately
+sql/alt_approach_temptables.sql   alternative: temp tables instead of CTEs
+sql/investigation_steps.sql       the queries behind the bridge, in the order run
+
+scripts/validate_independent.py   independent (non-SQL) cross-check of the final number
+
+data/comm_log.db                  raw data (SQLite)
+data/campaign.csv                 same data, CSV
+data/communication_log.csv        same data, CSV
+data/DATA_DICTIONARY.md           schema + data dictionary as provided
+data/generate_dataset.py          script that generated the synthetic dataset, as provided
 ```
